@@ -3,3 +3,5 @@ librosa
 soundfile
 numpy
 pretty_midi
+# Required by librosa to decode formats such as M4A/AAC
+av
