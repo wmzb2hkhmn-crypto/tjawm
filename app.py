@@ -4,8 +4,7 @@ import numpy as np
 import pretty_midi
 import tempfile
 import os
-import shutil
-import subprocess
+import av
 
 
 st.title("🎵 音声 to MIDI 変換ツール")
@@ -20,41 +19,27 @@ def cleanup_file(path):
             pass
 
 
-def convert_to_wav(input_path):
-    """librosa で扱えないフォーマット（M4A/AAC など）を WAV に変換する。"""
-    if not input_path:
-        return input_path
+def load_audio(path, target_sr=44100):
+    """PyAV で音声を読み込み、ffmpeg 実行ファイル不要で mono float32 に変換する。"""
+    chunks = []
+    with av.open(path) as container:
+        if not container.streams.audio:
+            raise ValueError("ファイルに音声トラックがありません。")
 
-    ext = os.path.splitext(input_path)[1].lower()
-    if ext == ".wav":
-        return input_path
+        resampler = av.AudioResampler(format="fltp", layout="mono", rate=target_sr)
+        for frame in container.decode(audio=0):
+            resampled_frames = resampler.resample(frame)
+            if resampled_frames:
+                chunks.extend(frame.to_ndarray().reshape(-1) for frame in resampled_frames)
 
-    ffmpeg_path = shutil.which("ffmpeg")
-    if ffmpeg_path is None:
-        raise RuntimeError(
-            "ffmpeg が見つかりません。システムに ffmpeg をインストールしてから再実行してください。"
-        )
+        # Resampler に残っている末尾のサンプルを回収する
+        remaining_frames = resampler.resample(None)
+        if remaining_frames:
+            chunks.extend(frame.to_ndarray().reshape(-1) for frame in remaining_frames)
 
-    converted_path = input_path + ".converted.wav"
-    subprocess.run(
-        [
-            ffmpeg_path,
-            "-y",
-            "-i",
-            input_path,
-            "-vn",
-            "-acodec",
-            "pcm_s16le",
-            "-ar",
-            "44100",
-            "-ac",
-            "1",
-            converted_path,
-        ],
-        capture_output=True,
-        check=True,
-    )
-    return converted_path
+    if not chunks:
+        raise ValueError("音声データを読み込めませんでした。別のファイルをお試しください。")
+    return np.concatenate(chunks).astype(np.float32, copy=False), target_sr
 
 
 def add_note(instrument, pitch, start_time, end_time):
@@ -71,32 +56,22 @@ def add_note(instrument, pitch, start_time, end_time):
     instrument.notes.append(note)
 
 
-if "audio_temp_path" not in st.session_state:
-    st.session_state.audio_temp_path = None
-
 uploaded_file = st.file_uploader("音声ファイルを選択してください", type=["wav", "mp3", "m4a", "aac", "ogg"])
 
 if uploaded_file is not None:
     file_ext = os.path.splitext(uploaded_file.name)[1]
-    tmp_path = None
-    converted_path = None
-
-    if st.session_state.audio_temp_path and st.session_state.audio_temp_path != uploaded_file.name:
-        cleanup_file(st.session_state.audio_temp_path)
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
-        tmp_file.write(uploaded_file.read())
-        tmp_path = tmp_file.name
-
-    st.session_state.audio_temp_path = tmp_path
 
     if st.button("変換を実行する", type="primary"):
+        input_path = None
         output_path = None
         with st.spinner("音声を解析中...しばらくお待ちください"):
             try:
-                # M4A / AAC など librosa が直接扱えない形式は WAV に変換してから解析する
-                converted_path = convert_to_wav(tmp_path)
-                y, sr = librosa.load(converted_path, sr=None, mono=True)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
+                    tmp_file.write(uploaded_file.getvalue())
+                    input_path = tmp_file.name
+
+                # PyAV は M4A/AAC も読み込めるため、システムへの ffmpeg 別途インストールは不要
+                y, sr = load_audio(input_path)
                 if y.size == 0:
                     raise ValueError("音声データが空です。別のファイルをお試しください。")
 
@@ -123,8 +98,7 @@ if uploaded_file is not None:
 
                     if np.isnan(pitch):
                         if current_pitch is not None:
-                            end_time = t
-                            add_note(instrument, current_pitch, start_time, end_time)
+                            add_note(instrument, current_pitch, start_time, t)
                             current_pitch = None
                         continue
 
@@ -133,14 +107,12 @@ if uploaded_file is not None:
                         current_pitch = midi_num
                         start_time = t
                     elif current_pitch != midi_num:
-                        end_time = t
-                        add_note(instrument, current_pitch, start_time, end_time)
+                        add_note(instrument, current_pitch, start_time, t)
                         current_pitch = midi_num
                         start_time = t
 
                 if current_pitch is not None:
-                    end_time = len(f0) * time_step
-                    add_note(instrument, current_pitch, start_time, end_time)
+                    add_note(instrument, current_pitch, start_time, len(f0) * time_step)
 
                 if len(instrument.notes) == 0:
                     raise ValueError("有効な音符を検出できませんでした。音声が無音または短すぎる可能性があります。")
@@ -150,19 +122,17 @@ if uploaded_file is not None:
                     output_path = output_file.name
                 midi.write(output_path)
 
-                st.success("変換が完了しました！")
-
                 with open(output_path, "rb") as f:
-                    st.download_button(
-                        label="📥 MIDIファイルをダウンロード",
-                        data=f,
-                        file_name="converted_output.mid",
-                        mime="audio/midi",
-                    )
+                    midi_data = f.read()
+                st.success("変換が完了しました！")
+                st.download_button(
+                    label="📥 MIDIファイルをダウンロード",
+                    data=midi_data,
+                    file_name="converted_output.mid",
+                    mime="audio/midi",
+                )
             except Exception as e:
                 st.error(f"エラーが発生しました: {e}")
             finally:
-                cleanup_file(tmp_path)
-                cleanup_file(converted_path)
+                cleanup_file(input_path)
                 cleanup_file(output_path)
-                st.session_state.audio_temp_path = None
