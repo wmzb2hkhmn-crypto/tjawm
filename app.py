@@ -4,6 +4,8 @@ import numpy as np
 import pretty_midi
 import tempfile
 import os
+import shutil
+import subprocess
 
 
 st.title("🎵 音声 to MIDI 変換ツール")
@@ -16,6 +18,43 @@ def cleanup_file(path):
             os.remove(path)
         except OSError:
             pass
+
+
+def convert_to_wav(input_path):
+    """librosa で扱えないフォーマット（M4A/AAC など）を WAV に変換する。"""
+    if not input_path:
+        return input_path
+
+    ext = os.path.splitext(input_path)[1].lower()
+    if ext == ".wav":
+        return input_path
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        raise RuntimeError(
+            "ffmpeg が見つかりません。システムに ffmpeg をインストールしてから再実行してください。"
+        )
+
+    converted_path = input_path + ".converted.wav"
+    subprocess.run(
+        [
+            ffmpeg_path,
+            "-y",
+            "-i",
+            input_path,
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "44100",
+            "-ac",
+            "1",
+            converted_path,
+        ],
+        capture_output=True,
+        check=True,
+    )
+    return converted_path
 
 
 def add_note(instrument, pitch, start_time, end_time):
@@ -35,11 +74,12 @@ def add_note(instrument, pitch, start_time, end_time):
 if "audio_temp_path" not in st.session_state:
     st.session_state.audio_temp_path = None
 
-uploaded_file = st.file_uploader("音声ファイルを選択してください", type=["wav", "mp3", "m4a", "ogg"])
+uploaded_file = st.file_uploader("音声ファイルを選択してください", type=["wav", "mp3", "m4a", "aac", "ogg"])
 
 if uploaded_file is not None:
     file_ext = os.path.splitext(uploaded_file.name)[1]
     tmp_path = None
+    converted_path = None
 
     if st.session_state.audio_temp_path and st.session_state.audio_temp_path != uploaded_file.name:
         cleanup_file(st.session_state.audio_temp_path)
@@ -54,7 +94,9 @@ if uploaded_file is not None:
         output_path = None
         with st.spinner("音声を解析中...しばらくお待ちください"):
             try:
-                y, sr = librosa.load(tmp_path, sr=None, mono=True)
+                # M4A / AAC など librosa が直接扱えない形式は WAV に変換してから解析する
+                converted_path = convert_to_wav(tmp_path)
+                y, sr = librosa.load(converted_path, sr=None, mono=True)
                 if y.size == 0:
                     raise ValueError("音声データが空です。別のファイルをお試しください。")
 
@@ -121,5 +163,6 @@ if uploaded_file is not None:
                 st.error(f"エラーが発生しました: {e}")
             finally:
                 cleanup_file(tmp_path)
+                cleanup_file(converted_path)
                 cleanup_file(output_path)
                 st.session_state.audio_temp_path = None
